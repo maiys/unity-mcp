@@ -255,6 +255,8 @@ async def get_editor_state(ctx: Context) -> MCPResponse:
             if inferred:
                 unity_section["instance_id"] = inferred
 
+    external_changes: dict[str, int | bool | None] | None = None
+
     # External change detection (server-side): compute per instance based on project root path.
     try:
         instance_id = unity_section.get("instance_id")
@@ -271,22 +273,51 @@ async def get_editor_state(ctx: Context) -> MCPResponse:
                 external_changes_scanner.set_project_root(
                     instance_id, project_root)
 
-            ext = external_changes_scanner.update_and_get(instance_id)
-
-            assets = state_v2.get("assets")
-            if not isinstance(assets, dict):
-                assets = {}
-                state_v2["assets"] = assets
-            assets["external_changes_dirty"] = bool(
-                ext.get("external_changes_dirty", False))
-            assets["external_changes_last_seen_unix_ms"] = ext.get(
-                "external_changes_last_seen_unix_ms")
-            assets["external_changes_dirty_since_unix_ms"] = ext.get(
-                "dirty_since_unix_ms")
-            assets["external_changes_last_cleared_unix_ms"] = ext.get(
-                "last_cleared_unix_ms")
+            external_changes = external_changes_scanner.update_and_get(instance_id)
     except Exception:
         pass
+
+    if external_changes is not None:
+        try:
+            # The recursive scan can take seconds. Re-read Unity so advice and staleness
+            # describe the snapshot returned to the client rather than the pre-scan one.
+            refreshed_response = await unity_transport.send_with_unity_instance(
+                async_send_command_with_retry,
+                unity_instance,
+                "get_editor_state",
+                {},
+            )
+            refreshed_state = refreshed_response.get("data") if isinstance(
+                refreshed_response, dict) and isinstance(
+                    refreshed_response.get("data"), dict) else None
+            if refreshed_state is not None:
+                state_v2 = refreshed_state
+                state_v2.setdefault("schema_version", "unity-mcp/editor_state@2")
+                state_v2.setdefault("observed_at_unix_ms", _now_unix_ms())
+                state_v2.setdefault("sequence", 0)
+
+                refreshed_unity = state_v2.get("unity")
+                if not isinstance(refreshed_unity, dict):
+                    refreshed_unity = {}
+                    state_v2["unity"] = refreshed_unity
+                if refreshed_unity.get("instance_id") in (None, ""):
+                    refreshed_unity["instance_id"] = instance_id
+        except Exception:
+            pass
+
+    if external_changes is not None:
+        assets = state_v2.get("assets")
+        if not isinstance(assets, dict):
+            assets = {}
+            state_v2["assets"] = assets
+        assets["external_changes_dirty"] = bool(
+            external_changes.get("external_changes_dirty", False))
+        assets["external_changes_last_seen_unix_ms"] = external_changes.get(
+            "external_changes_last_seen_unix_ms")
+        assets["external_changes_dirty_since_unix_ms"] = external_changes.get(
+            "dirty_since_unix_ms")
+        assets["external_changes_last_cleared_unix_ms"] = external_changes.get(
+            "last_cleared_unix_ms")
 
     state_v2 = _enrich_advice_and_staleness(state_v2)
 
